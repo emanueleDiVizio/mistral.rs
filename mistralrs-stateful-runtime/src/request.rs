@@ -53,3 +53,10 @@ impl StatefulRequest {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedStatefulRequest {
+    pub session_config: mistralrs::DecodeSessionConfig,
+    pub input_ids: Vec<u32>,
+    pub max_tokens: usize,
+    pub skip_special_tokens: bool,
+}

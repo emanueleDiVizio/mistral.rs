@@ -18,9 +18,8 @@ mod stream;
 
 pub use error::{Error, Result};
 pub use features::RuntimeFeatures;
-pub use request::StatefulRequest;
+pub use request::{PreparedStatefulRequest, StatefulRequest};
 pub use scheduler::{FairnessPolicy, PrefillPolicy, SchedulerRequest, SchedulerSketch};
 pub use session::{FinishReason, SessionStats};
 pub use single_seq::{SingleSeqOutput, StatefulRuntime};
 pub use stream::{DeltaEvent, StatefulStreamOutput};
-
