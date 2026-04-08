@@ -72,12 +72,13 @@ where
     Tensor::cat(&attn_chunks, 2)
 }
 
-fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
+fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
-        Ok(x)
+        // No repetition needed - just clone the reference
+        Ok(x.clone())
     } else {
         let (b_sz, n_kv_head, seq_len, head_dim) = x.dims4()?;
-        Tensor::cat(&vec![&x; n_rep], 2)?.reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
+        Tensor::cat(&vec![x; n_rep], 2)?.reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
     }
 }
 
@@ -183,13 +184,7 @@ impl Sdpa {
             mask.layout().broadcast_as(tgt_mask_shape.clone()).is_ok()
                 && sdpa_params.softcap.is_none_or(|x| x == 1.0)
         });
-        let valid_head_dims: &[usize] = if seq_len == 1 {
-            &[32, 64, 72, 80, 96, 128, 256]
-        } else {
-            // Not sure why the full kernel doesn't like 256.
-            // [32, 64, 72, 80, 96, 128, 256]
-            &[32, 64, 72, 80, 96, 128]
-        };
+        let valid_head_dims: &[usize] = &[32, 64, 72, 80, 96, 128, 256];
         if [q, k, v].into_iter().all(|x| x.device().is_metal())
             && all_head_dims_match
             && valid_head_dims.contains(&head_dim)
@@ -210,8 +205,9 @@ impl Sdpa {
             );
         }
 
-        let k = repeat_kv(k.clone(), sdpa_params.n_kv_groups)?;
-        let v = repeat_kv(v.clone(), sdpa_params.n_kv_groups)?;
+        // Pass by reference to repeat_kv - it will clone internally only if n_rep > 1
+        let k = repeat_kv(k, sdpa_params.n_kv_groups)?;
+        let v = repeat_kv(v, sdpa_params.n_kv_groups)?;
 
         if mask.is_some_and(|x| x.rank() == 2) || mistralrs_quant::distributed::use_nccl() {
             return naive_sdpa(
