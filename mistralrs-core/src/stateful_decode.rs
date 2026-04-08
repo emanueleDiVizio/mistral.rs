@@ -70,7 +70,10 @@ pub struct DecodeStepOutput {
 
 /// Result of advancing multiple externally managed sessions together.
 #[derive(Debug, Clone, Default)]
-pub struct BatchDecodeOutput;
+pub struct BatchDecodeOutput {
+    /// Per-session decode results in the same order as the input sessions.
+    pub outputs: Vec<DecodeStepOutput>,
+}
 
 /// Configuration for a stateful decode session.
 #[derive(Debug, Clone)]
@@ -597,12 +600,170 @@ impl StatefulModel {
 
     pub fn decode_batch(
         &self,
-        _sessions: &mut [&mut DecodeSession],
-        _token_ids: &[u32],
+        sessions: &mut [&mut DecodeSession],
+        token_ids: &[u32],
     ) -> Result<BatchDecodeOutput, MistralRsError> {
-        Err(MistralRsError::Unsupported(
-            "external batched decode is not exposed by this backend yet".into(),
-        ))
+        if sessions.is_empty() {
+            return Ok(BatchDecodeOutput::default());
+        }
+        if sessions.len() != token_ids.len() {
+            return Err(MistralRsError::Unsupported(format!(
+                "decode_batch expected {} token ids, got {}",
+                sessions.len(),
+                token_ids.len()
+            )));
+        }
+
+        let mut sequences = Vec::with_capacity(sessions.len());
+        for (session, &token_id) in sessions.iter_mut().zip(token_ids.iter()) {
+            let runtime = session.runtime.as_ref().ok_or_else(|| {
+                MistralRsError::Unsupported("decode session is missing runtime state".into())
+            })?;
+            if !Arc::ptr_eq(runtime, &self.runtime) {
+                return Err(MistralRsError::Unsupported(
+                    "decode_batch sessions must belong to the same StatefulModel".into(),
+                ));
+            }
+
+            let sequence = session.sequence.take().ok_or_else(|| {
+                MistralRsError::Unsupported("decode session is missing sequence state".into())
+            })?;
+
+            let is_prompt = sequence.is_prompt() || sequence.is_waiting();
+            if is_prompt {
+                session.sequence = Some(sequence);
+                return Err(MistralRsError::Unsupported(
+                    "decode_batch currently supports completion-phase sessions only".into(),
+                ));
+            }
+
+            let expected = sequence.get_toks().last().copied().ok_or_else(|| {
+                MistralRsError::Unsupported(
+                    "decode session has no prior token to continue from".into(),
+                )
+            })?;
+            if token_id != expected {
+                session.sequence = Some(sequence);
+                return Err(MistralRsError::Unsupported(format!(
+                    "stateful decode_batch currently uses backend-managed sampling; expected token {expected}, got {token_id}"
+                )));
+            }
+
+            sequence.set_state(SequenceState::RunningCompletion);
+            sequences.push(sequence);
+        }
+
+        let restore_sequences =
+            |sessions: &mut [&mut DecodeSession], sequences: Vec<Sequence>| -> Result<(), MistralRsError> {
+                for (session, sequence) in sessions.iter_mut().zip(sequences.into_iter()) {
+                    session.sequence = Some(sequence);
+                }
+                Ok(())
+            };
+
+        if self.runtime.has_paged_attention {
+            let mut kv_mgr = self
+                .runtime
+                .paged_kv_cache_manager
+                .as_ref()
+                .ok_or_else(|| {
+                    MistralRsError::Unsupported(
+                        "paged attention is enabled but no KV cache manager is present".into(),
+                    )
+                })?
+                .try_lock()
+                .map_err(|_| {
+                    MistralRsError::Unsupported(
+                        "stateful paged KV manager is currently busy; try again".into(),
+                    )
+                })?;
+
+            for sequence in &sequences {
+                kv_mgr
+                    .allocate_slots(*sequence.id(), sequence.len() + 1, &[])
+                    .ok_or_else(|| {
+                        MistralRsError::Unsupported(
+                            "failed to allocate paged KV slots for stateful batched decode".into(),
+                        )
+                    })?;
+            }
+        }
+
+        match run_stateful_future(async {
+            let mut pipeline = self.runtime.pipeline.lock().await;
+            let mut prefix_cacher = self.runtime.prefix_cacher.lock().await;
+
+            let mut seq_refs = sequences.iter_mut().collect::<Vec<_>>();
+            if self.runtime.has_paged_attention {
+                let block_size = {
+                    let kv_mgr = self
+                        .runtime
+                        .paged_kv_cache_manager
+                        .as_ref()
+                        .expect("paged KV manager exists when paged attention is enabled")
+                        .lock()
+                        .await;
+                    kv_mgr.block_size()
+                };
+                let metadata = PagedAttentionMeta {
+                    block_size,
+                    sliding_window: pipeline.get_metadata().sliding_window,
+                    kv_cache_manager: self
+                        .runtime
+                        .paged_kv_cache_manager
+                        .as_ref()
+                        .expect("paged KV manager exists when paged attention is enabled")
+                        .clone(),
+                };
+                pipeline
+                    .step(
+                        &mut seq_refs,
+                        false,
+                        false,
+                        &mut prefix_cacher,
+                        self.engine_config.disable_eos_stop,
+                        self.runtime.rng.clone(),
+                        CacheBackendMetadata::PagedAttention { metadata },
+                    )
+                    .await
+            } else {
+                pipeline
+                    .step(
+                        &mut seq_refs,
+                        false,
+                        false,
+                        &mut prefix_cacher,
+                        self.engine_config.disable_eos_stop,
+                        self.runtime.rng.clone(),
+                        CacheBackendMetadata::DefaultInstructions {
+                            pre_op: CacheInstruction::In,
+                            post_op: CacheInstruction::Out,
+                        },
+                    )
+                    .await
+            }
+        }) {
+            Ok(_duration) => (),
+            Err(e) => {
+                let _ = restore_sequences(sessions, sequences);
+                return Err(MistralRsError::Unsupported(format!(
+                    "stateful batched decode failed: {e}"
+                )));
+            }
+        };
+
+        let mut outputs = Vec::with_capacity(sequences.len());
+        for sequence in &mut sequences {
+            outputs.push(DecodeStepOutput {
+                token: sequence.logprobs().last().map(|logprob| logprob.token),
+                text_delta: sequence.peek_delta().ok().flatten(),
+                is_done: matches!(sequence.getstate(), SequenceState::Done(_)),
+            });
+            sequence.step_start_instant = None;
+        }
+
+        restore_sequences(sessions, sequences)?;
+        Ok(BatchDecodeOutput { outputs })
     }
 }
 

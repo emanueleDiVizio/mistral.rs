@@ -19,6 +19,20 @@ pub struct SingleSeqOutput {
     pub finish_reason: FinishReason,
 }
 
+struct ActiveSequence {
+    index: usize,
+    session: mistralrs::DecodeSession,
+    last_token: u32,
+    remaining_tokens: usize,
+    tokens: Vec<u32>,
+    deltas: Vec<DeltaEvent>,
+    visible_text: String,
+    stats: SessionStats,
+    finish_reason: FinishReason,
+    done: bool,
+    skip_special_tokens: bool,
+}
+
 impl StatefulRuntime {
     pub fn new(model: mistralrs::Model, stateful: mistralrs::StatefulModel) -> Self {
         Self { model, stateful }
@@ -195,5 +209,151 @@ impl StatefulRuntime {
             stats,
             finish_reason,
         })
+    }
+
+    pub async fn run_batch(
+        &self,
+        requests: Vec<StatefulRequest>,
+    ) -> Result<Vec<SingleSeqOutput>> {
+        let mut prepared = Vec::with_capacity(requests.len());
+        for request in requests {
+            prepared.push(self.prepare_text_request(request).await?);
+        }
+        self.run_prepared_batch(prepared).await
+    }
+
+    pub async fn run_prepared_batch(
+        &self,
+        prepared: Vec<PreparedStatefulRequest>,
+    ) -> Result<Vec<SingleSeqOutput>> {
+        let mut active = Vec::with_capacity(prepared.len());
+        let mut completed = vec![None; prepared.len()];
+
+        for (index, prepared) in prepared.into_iter().enumerate() {
+            if prepared.input_ids.is_empty() {
+                return Err(Error::EmptyPrompt);
+            }
+
+            let mut session = self
+                .stateful
+                .new_decode_session(prepared.session_config)?;
+            let prefill = self.stateful.prefill(&mut session, &prepared.input_ids)?;
+
+            active.push(ActiveSequence {
+                index,
+                session,
+                last_token: *prepared.input_ids.last().expect("checked non-empty"),
+                remaining_tokens: prepared.max_tokens,
+                tokens: Vec::new(),
+                deltas: Vec::new(),
+                visible_text: String::new(),
+                stats: SessionStats {
+                    prompt_tokens: prefill.prompt_tokens,
+                    cached_prompt_tokens: prefill.cached_prompt_tokens,
+                    completion_tokens: 0,
+                },
+                finish_reason: FinishReason::Length,
+                done: false,
+                skip_special_tokens: prepared.skip_special_tokens,
+            });
+        }
+
+        while !active.is_empty() {
+            let token_ids = active.iter().map(|seq| seq.last_token).collect::<Vec<_>>();
+            let mut sessions = active
+                .iter_mut()
+                .map(|seq| &mut seq.session)
+                .collect::<Vec<_>>();
+            let batch = self.stateful.decode_batch(&mut sessions, &token_ids)?;
+
+            if batch.outputs.len() != active.len() {
+                return Err(Error::Build(anyhow::anyhow!(
+                    "decode_batch returned {} outputs for {} active sessions",
+                    batch.outputs.len(),
+                    active.len()
+                )));
+            }
+
+            for (sequence, output) in active.iter_mut().zip(batch.outputs.into_iter()) {
+                let Some(token) = output.token else {
+                    sequence.finish_reason = FinishReason::Stop;
+                    sequence.done = true;
+                    continue;
+                };
+
+                sequence.stats.completion_tokens += 1;
+                sequence.remaining_tokens = sequence.remaining_tokens.saturating_sub(1);
+
+                let text_delta = match output.text_delta {
+                    Some(delta) => {
+                        if let Some(suffix) = delta.strip_prefix(&sequence.visible_text) {
+                            sequence.visible_text.push_str(suffix);
+                            if suffix.is_empty() {
+                                None
+                            } else {
+                                Some(suffix.to_string())
+                            }
+                        } else {
+                            sequence.visible_text = delta.clone();
+                            if delta.is_empty() {
+                                None
+                            } else {
+                                Some(delta)
+                            }
+                        }
+                    }
+                    None => {
+                        let detok = self
+                            .model
+                            .detokenize(vec![token], sequence.skip_special_tokens)
+                            .await?;
+                        if detok.is_empty() {
+                            None
+                        } else {
+                            sequence.visible_text.push_str(&detok);
+                            Some(detok)
+                        }
+                    }
+                };
+
+                sequence.deltas.push(DeltaEvent {
+                    token,
+                    text_delta,
+                    is_done: output.is_done,
+                });
+                sequence.tokens.push(token);
+                sequence.last_token = token;
+
+                if output.is_done {
+                    sequence.finish_reason = FinishReason::Stop;
+                    sequence.done = true;
+                } else if sequence.remaining_tokens == 0 {
+                    sequence.finish_reason = FinishReason::Length;
+                    sequence.done = true;
+                }
+            }
+
+            let mut i = 0usize;
+            while i < active.len() {
+                if active[i].done {
+                    let sequence = active.swap_remove(i);
+                    completed[sequence.index] = Some(SingleSeqOutput {
+                        text: sequence.visible_text,
+                        tokens: sequence.tokens,
+                        stats: sequence.stats,
+                        finish_reason: sequence.finish_reason,
+                    });
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        completed
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| Error::Build(anyhow::anyhow!("batch output missing completion")))
+            })
+            .collect()
     }
 }
