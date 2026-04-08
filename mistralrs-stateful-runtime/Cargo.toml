@@ -1,0 +1,19 @@
+[package]
+name = "mistralrs-stateful-runtime"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Experimental runtime utilities for mistral.rs stateful decode."
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+either.workspace = true
+mistralrs.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

@@ -4,6 +4,7 @@ members = [
     "mistralrs-server",
     "mistralrs-cli",
     "mistralrs-core",
+    "mistralrs-stateful-runtime",
     "mistralrs-pyo3",
     "mistralrs",
     "mistralrs-bench",

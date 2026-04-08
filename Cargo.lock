@@ -3814,6 +3814,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mistralrs-stateful-runtime"
+version = "0.7.1-alpha.1"
+dependencies = [
+ "anyhow",
+ "either",
+ "mistralrs",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "mistralrs-vision"
 version = "0.7.1-alpha.1"
 dependencies = [
