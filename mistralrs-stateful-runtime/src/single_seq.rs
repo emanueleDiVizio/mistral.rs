@@ -2,7 +2,8 @@ use either::Either;
 
 use crate::{
     DeltaEvent, Error, FinishReason, PreparedStatefulRequest, Result, RuntimeFeatures,
-    SessionStats, StatefulRequest, StatefulStreamOutput,
+    SessionStats, StatefulBatchCompletion, StatefulChoice, StatefulCompletion, StatefulRequest,
+    StatefulStreamOutput,
 };
 
 #[derive(Clone)]
@@ -56,6 +57,10 @@ impl StatefulRuntime {
         &self.stateful
     }
 
+    pub fn model_name(&self) -> &str {
+        self.stateful.model_id()
+    }
+
     pub async fn run(&self, request: StatefulRequest) -> Result<SingleSeqOutput> {
         let prepared = self.prepare_text_request(request).await?;
         let output = self.run_prepared_streaming(prepared).await?;
@@ -64,6 +69,18 @@ impl StatefulRuntime {
             tokens: output.tokens,
             stats: output.stats,
             finish_reason: output.finish_reason,
+        })
+    }
+
+    pub async fn complete(&self, request: StatefulRequest) -> Result<StatefulCompletion> {
+        let output = self.run(request).await?;
+        Ok(StatefulCompletion {
+            model: self.model_name().to_string(),
+            choice: StatefulChoice {
+                text: output.text,
+                finish_reason: output.finish_reason,
+            },
+            usage: output.stats,
         })
     }
 
@@ -220,6 +237,26 @@ impl StatefulRuntime {
             prepared.push(self.prepare_text_request(request).await?);
         }
         self.run_prepared_batch(prepared).await
+    }
+
+    pub async fn complete_batch(
+        &self,
+        requests: Vec<StatefulRequest>,
+    ) -> Result<StatefulBatchCompletion> {
+        let outputs = self.run_batch(requests).await?;
+        let usage = SessionStats::merge_all(outputs.iter().map(|out| out.stats.clone()));
+        let choices = outputs
+            .into_iter()
+            .map(|out| StatefulChoice {
+                text: out.text,
+                finish_reason: out.finish_reason,
+            })
+            .collect();
+        Ok(StatefulBatchCompletion {
+            model: self.model_name().to_string(),
+            choices,
+            usage,
+        })
     }
 
     pub async fn run_prepared_batch(

@@ -11,6 +11,7 @@
 mod error;
 mod features;
 mod request;
+mod response;
 mod scheduler;
 mod session;
 mod single_seq;
@@ -19,6 +20,7 @@ mod stream;
 pub use error::{Error, Result};
 pub use features::RuntimeFeatures;
 pub use request::{PreparedStatefulRequest, StatefulRequest};
+pub use response::{StatefulBatchCompletion, StatefulChoice, StatefulCompletion};
 pub use scheduler::{FairnessPolicy, PrefillPolicy, SchedulerRequest, SchedulerSketch};
 pub use session::{FinishReason, SessionStats};
 pub use single_seq::{SingleSeqOutput, StatefulRuntime};
