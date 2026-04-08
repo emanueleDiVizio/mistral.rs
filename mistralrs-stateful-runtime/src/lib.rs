@@ -21,7 +21,10 @@ pub use error::{Error, Result};
 pub use features::RuntimeFeatures;
 pub use request::{PreparedStatefulRequest, StatefulRequest};
 pub use response::{StatefulBatchCompletion, StatefulChoice, StatefulCompletion};
-pub use scheduler::{FairnessPolicy, PrefillPolicy, SchedulerRequest, SchedulerSketch};
+pub use scheduler::{
+    FairnessPolicy, PrefillPolicy, SchedulerConfig, SchedulerRequest, SchedulerSketch,
+    StatefulScheduler,
+};
 pub use session::{FinishReason, SessionStats};
 pub use single_seq::{SingleSeqOutput, StatefulRuntime};
 pub use stream::{DeltaEvent, StatefulStreamOutput};
